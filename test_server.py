@@ -1,18 +1,17 @@
-import json
+import os
 import logging
-import base64
-import io
 import time
+import argparse
+import pickle
+import math
 
-from PIL import Image
-from scipy.misc import imresize
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import torch
+import cv2
 
-from options.test_options import TestOptions
-from data.base_dataset import get_transform
-from models import create_model
-from util.util import tensor2im
+import utils
+import networks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,61 +21,147 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class CycleGANWorker:
+class FBVCWorker:
 
     def __init__(self):
-        logger.info("Initializing ..")
-        opt = TestOptions().parse()
-        opt.nThreads = 1   # test code only supports nThreads = 1
-        opt.batchSize = 1  # test code only supports batchSize = 1
-        opt.serial_batches = True  # no shuffle
-        opt.no_flip = True  # no flip
-        opt.display_id = -1  # no visdom display
-        self.transform = get_transform(opt)
 
-        self.model = create_model(opt)
-        self.model.setup(opt)
-        logger.info("Initialization done")
+        self.opts = self._get_opts()
+        print(self.opts)
 
-    def infer(self, img):
+        if self.opts.cuda and not torch.cuda.is_available():
+            raise Exception("No GPU found, please run without -cuda")
+
+        self._init_model(self.opts)
+        self.frame_i1 = None
+        self.frame_i2 = None
+        self.frame_o1 = None
+        self.frame_o2 = None
+        self.frame_p1 = None
+        self.frame_p2 = None
+        self.lstm_state = None
+        self.H_orig = None
+        self.W_orig = None
+        self.H_sr = None
+        self.W_sr = None
+        self.output_dir = './output_dir_tmp'
+
+    def _get_opts(self):
+        parser = argparse.ArgumentParser(
+            description='Fast Blind Video Temporal Consistency'
+        )
+
+        # dataset options
+        parser.add_argument(
+            '-dataset', type=str, required=True, help='dataset to test')
+        parser.add_argument(
+            '-phase', type=str, default="test", choices=["train", "test"])
+        parser.add_argument(
+            '-data_dir', type=str, default='data', help='path to data folder')
+        parser.add_argument(
+            '-list_dir', type=str, default='lists', help='path to list folder')
+        parser.add_argument(
+            '-task', type=str, required=True, help='evaluated task')
+        parser.add_argument(
+            '-redo', action="store_true", help='Re-generate results')
+
+        # other options
+        parser.add_argument(
+            '-gpu', type=int, default=0, help='gpu device id')
+
+        opts = parser.parse_args()
+        opts.cuda = True
+
+        # Inputs to TransformNet need to be divided by 4
+        opts.size_multiplier = 2 ** 2
+
+        return opts
+
+    def _init_model(self, opts):
+        # load model opts
+        opts_filename = os.path.join(
+            'pretrained_models', "ECCV18_blind_consistency_opts.pth")
+        print("Load %s" % opts_filename)
+        with open(opts_filename, 'r') as f:
+            model_opts = pickle.load(f)
+
+        # initialize model
+        print('===> Initializing model from %s...' % model_opts.model)
+        self.model = networks.__dict__[model_opts.model](
+            model_opts, nc_in=12, nc_out=3)
+
+        # load trained model
+        model_filename = os.path.join(
+            'pretrained_models', "ECCV18_blind_consistency.pth")
+        print("Load %s" % model_filename)
+        state_dict = torch.load(model_filename)
+        self.model.load_state_dict(state_dict['model'])
+
+        # convert to GPU
+        self.device = torch.device("cuda" if opts.cuda else "cpu")
+        self.model = self.model.to(self.device)
+
+        self.model.eval()
+
+    def _convert_input(self):
+        self.frame_i1 = cv2.resize(self.frame_i1, (self.W_sc, self.H_sc))
+        self.frame_i2 = cv2.resize(self.frame_i2, (self.W_sc, self.H_sc))
+        self.frame_o1 = cv2.resize(self.frame_o1, (self.W_sc, self.H_sc))
+        self.frame_p2 = cv2.resize(self.frame_p2, (self.W_sc, self.H_sc))
+        # convert to tensor
+        self.frame_i1 = utils.img2tensor(self.frame_i1).to(self.device)
+        self.frame_i2 = utils.img2tensor(self.frame_i2).to(self.device)
+        self.frame_o1 = utils.img2tensor(self.frame_o1).to(self.device)
+        self.frame_p2 = utils.img2tensor(self.frame_p2).to(self.device)
+
+        # model input
+        inputs = torch.cat(
+            (self.frame_p2, self.frame_o1, self.frame_i2, self.frame_o1),
+            dim=1
+        )
+        return inputs
+
+    def infer(self, img, frame_count):
 
         start_time = time.time()
-        aspect_ratio = img.size[0] / img.size[1]
-        img = self.transform(img)
-        img = img.unsqueeze(0)
 
-        data = {
-            "A": img,
-            "A_paths": "test.jpeg"
-        }
-        self.model.set_input(data)
-        self.model.test()
-        visuals = self.model.get_current_visuals()
-        for label, im_data in visuals.items():
-            if 'fake' not in label:
-                continue
-            im = tensor2im(im_data)
-            h, w, _ = im.shape
-            if aspect_ratio > 1.0:
-                im = imresize(im, (h, int(w * aspect_ratio)), interp='bicubic')
-            if aspect_ratio < 1.0:
-                im = imresize(im, (int(h / aspect_ratio), w), interp='bicubic')
-            im = Image.fromarray(im)
+        if frame_count == 0:
+            self.frame_p1 = img
+            self.H_orig = self.frame_p1.shape[0]
+            self.W_orig = self.frame_p1.shape[1]
+            self.H_sc = int(math.ceil(float(
+                self.H_orig) / self.opts.size_multiplier
+            ) * self.opts.size_multiplier)
+            self.W_sc = int(math.ceil(float(
+                self.W_orig) / self.opts.size_multiplier
+            ) * self.opts.size_multiplier)
+            return img
 
-            with io.BytesIO() as buf:
-                im.save(buf, format="jpeg")
-                buf.seek(0)
-                encoded_string = base64.b64encode(buf.read())
-                encoded_result_image = (
-                    b'data:image/jpeg;base64,' + encoded_string
-                )
-                logger.info("Infer time: {}".format(time.time() - start_time))
-                return encoded_result_image
+        with torch.no_grad():
+            inputs = self._convert_input()
+            output, self.lstm_state = self.model(inputs, self.lstm_state)
+            self.frame_o2 = self.frame_p2 + output
+            # create new variable to detach from graph and avoid
+            # memory accumulation
+            self.lstm_state = utils.repackage_hidden(self.lstm_state)
+
+        # convert to numpy array
+        self.frame_o2 = utils.tensor2img(self.frame_o2)
+
+        # resize to original size
+        self.frame_o2 = cv2.resize(self.frame_o2, (self.W_orig, self.H_orig))
+
+        # return output frame
+        encoded_string = cv2.imencode(".jpg", self.frame_o2)[1].tostring()
+        encoded_result_image = (
+            b'data:image/jpeg;base64,' + encoded_string
+        )
+        logger.info("Infer time: {}".format(time.time() - start_time))
+        return encoded_result_image
 
 
 app = Flask(__name__)
 CORS(app)
-cycle_gan_worker = CycleGANWorker()
+fbvc_worker = FBVCWorker()
 
 
 @app.route('/hi', methods=['GET'])
@@ -84,8 +169,8 @@ def hi():
     return jsonify({"message": "Hi!"})
 
 
-@app.route('/cyclegan', methods=['POST'])
-def cyclegan():
+@app.route('/fbvc', methods=['POST'])
+def fast_blind_video_consistency():
     try:
         image_file = request.files['pic']
     except Exception as err:
@@ -97,15 +182,15 @@ def cyclegan():
     if image_file is None:
         raise InvalidUsage('There is no iamge')
     try:
-        image = Image.open(image_file)
+        image = utils.read_img(image_file)
     except Exception as err:
         logger.error(str(err), exc_info=True)
         raise InvalidUsage(
             f"{err}: request.files['pic'] {request.files['pic']} "
-            "could not be read by PIL"
+            "could not be read by opencv"
         )
     try:
-        result = cycle_gan_worker.infer(image)
+        result = fbvc_worker.infer(image)
     except Exception as err:
         logger.error(str(err), exc_info=True)
         raise InvalidUsage(
@@ -140,4 +225,4 @@ def handle_invalid_usage(error):
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=8081)
