@@ -36,8 +36,9 @@ class FBVCWorker:
         self.frame_i2 = None
         self.frame_o1 = None
         self.frame_o2 = None
-        self.frame_p1 = None
         self.frame_p2 = None
+        self.video_raw = None
+        self.video_processed = None
         self.lstm_state = None
         self.H_orig = None
         self.W_orig = None
@@ -52,15 +53,11 @@ class FBVCWorker:
 
         # dataset options
         parser.add_argument(
-            '-dataset', type=str, required=True, help='dataset to test')
-        parser.add_argument(
             '-phase', type=str, default="test", choices=["train", "test"])
         parser.add_argument(
             '-data_dir', type=str, default='data', help='path to data folder')
         parser.add_argument(
             '-list_dir', type=str, default='lists', help='path to list folder')
-        parser.add_argument(
-            '-task', type=str, required=True, help='evaluated task')
         parser.add_argument(
             '-redo', action="store_true", help='Re-generate results')
 
@@ -81,7 +78,7 @@ class FBVCWorker:
         opts_filename = os.path.join(
             'pretrained_models', "ECCV18_blind_consistency_opts.pth")
         print("Load %s" % opts_filename)
-        with open(opts_filename, 'r') as f:
+        with open(opts_filename, 'rb') as f:
             model_opts = pickle.load(f)
 
         # initialize model
@@ -120,23 +117,26 @@ class FBVCWorker:
         )
         return inputs
 
-    def infer(self, img, frame_count):
+    def infer(self, image_raw, image_processed, frame_count):
 
         start_time = time.time()
 
         if frame_count == 0:
-            self.frame_p1 = img
-            self.H_orig = self.frame_p1.shape[0]
-            self.W_orig = self.frame_p1.shape[1]
+            self.frame_i1 = image_raw
+            self.frame_o1 = image_processed
+            self.H_orig = self.frame_i1.shape[0]
+            self.W_orig = self.frame_i1.shape[1]
             self.H_sc = int(math.ceil(float(
                 self.H_orig) / self.opts.size_multiplier
             ) * self.opts.size_multiplier)
             self.W_sc = int(math.ceil(float(
                 self.W_orig) / self.opts.size_multiplier
             ) * self.opts.size_multiplier)
-            return img
+            return image_processed
 
         with torch.no_grad():
+            self.frame_i2 = image_raw
+            self.frame_p2 = image_processed
             inputs = self._convert_input()
             output, self.lstm_state = self.model(inputs, self.lstm_state)
             self.frame_o2 = self.frame_p2 + output
@@ -149,6 +149,10 @@ class FBVCWorker:
 
         # resize to original size
         self.frame_o2 = cv2.resize(self.frame_o2, (self.W_orig, self.H_orig))
+
+        # Set new i1 and o1
+        self.frame_i1 = image_raw
+        self.frame_o1 = self.frame_o2
 
         # return output frame
         encoded_string = cv2.imencode(".jpg", self.frame_o2)[1].tostring()
@@ -171,26 +175,40 @@ def hi():
 
 @app.route('/fbvc', methods=['POST'])
 def fast_blind_video_consistency():
+    """
     try:
-        image_file = request.files['pic']
+        fbvc_worker.infer()
+    except Exception as err:
+        logger.error(str(err), exc_info=True)
+    return
+
+    """
+
+    try:
+        image_file_raw = request.files['raw']
+        image_file_processed = request.files['processed']
     except Exception as err:
         logger.error(str(err), exc_info=True)
         raise InvalidUsage(
             f"{err}: request {request} "
-            "has no file['pic']"
+            "has no files['raw']"
         )
-    if image_file is None:
+    if image_file_raw is None or image_file_processed is None:
         raise InvalidUsage('There is no iamge')
     try:
-        image = utils.read_img(image_file)
+        image_raw = utils.read_img_from_file_storage(image_file_raw)
+        image_processed = utils.read_img_from_file_storage(
+            image_file_processed)
     except Exception as err:
         logger.error(str(err), exc_info=True)
         raise InvalidUsage(
-            f"{err}: request.files['pic'] {request.files['pic']} "
+            f"{err}: request.files['raw'] {request.files['raw']} "
             "could not be read by opencv"
         )
     try:
-        result = fbvc_worker.infer(image)
+        result = fbvc_worker.infer(
+            image_raw, image_processed, int(request.values['num'])
+        )
     except Exception as err:
         logger.error(str(err), exc_info=True)
         raise InvalidUsage(
