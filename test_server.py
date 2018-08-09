@@ -132,30 +132,31 @@ class FBVCWorker:
             self.W_sc = int(math.ceil(float(
                 self.W_orig) / self.opts.size_multiplier
             ) * self.opts.size_multiplier)
-            return image_processed
 
-        with torch.no_grad():
-            self.frame_i2 = image_raw
-            self.frame_p2 = image_processed
-            inputs = self._convert_input()
-            output, self.lstm_state = self.model(inputs, self.lstm_state)
-            self.frame_o2 = self.frame_p2 + output
-            # create new variable to detach from graph and avoid
-            # memory accumulation
-            self.lstm_state = utils.repackage_hidden(self.lstm_state)
+        else:
+            with torch.no_grad():
+                self.frame_i2 = image_raw
+                self.frame_p2 = image_processed
+                inputs = self._convert_input()
+                output, self.lstm_state = self.model(inputs, self.lstm_state)
+                self.frame_o2 = self.frame_p2 + output
+                # create new variable to detach from graph and avoid
+                # memory accumulation
+                self.lstm_state = utils.repackage_hidden(self.lstm_state)
 
-        # convert to numpy array
-        self.frame_o2 = utils.tensor2img(self.frame_o2)
+            # convert to numpy array
+            self.frame_o2 = utils.tensor2img(self.frame_o2)
 
-        # resize to original size
-        self.frame_o2 = cv2.resize(self.frame_o2, (self.W_orig, self.H_orig))
+            # resize to original size
+            self.frame_o2 = cv2.resize(
+                self.frame_o2, (self.W_orig, self.H_orig))
 
-        # Set new i1 and o1
-        self.frame_i1 = image_raw
-        self.frame_o1 = self.frame_o2
+            # Set new i1 and o1
+            self.frame_i1 = image_raw
+            self.frame_o1 = self.frame_o2
 
         # return output frame
-        encoded_string = cv2.imencode(".jpg", self.frame_o2)[1].tostring()
+        encoded_string = cv2.imencode(".jpg", self.frame_o1)[1].tostring()
         encoded_result_image = (
             b'data:image/jpeg;base64,' + encoded_string
         )
