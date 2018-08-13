@@ -262,6 +262,18 @@ def save_img(img, filename):
     cv2.imwrite(filename, img, [cv2.IMWRITE_PNG_COMPRESSION, 0])
 
 
+def export_img(img, w, h):
+    if img.ndim == 3:
+        img = img[:, :, ::-1] ### RGB to BGR
+
+    ## clip to [0, 1]
+    img = np.clip(img, 0, 1)
+
+    ## quantize to [0, 255]
+    img = np.uint8(img * 255.0)
+    return img
+
+
 ######################################################################################
 ##  Flow utility
 ######################################################################################

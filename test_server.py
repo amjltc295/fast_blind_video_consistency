@@ -157,7 +157,10 @@ class FBVCWorker:
             self.frame_o1 = self.frame_o2
 
         # return output frame
-        buf = cv2.imencode(".jpg", self.frame_o1)[1]
+        output_img = utils.export_img(
+            self.frame_o1, self.W_orig, self.H_orig
+        )
+        buf = cv2.imencode(".jpg", output_img)[1]
         encoded_string = base64.b64encode(buf)
         encoded_result_image = (
             b'data:image/jpeg;base64,' + encoded_string
